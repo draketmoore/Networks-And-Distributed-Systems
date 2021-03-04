@@ -1,0 +1,215 @@
+#!/usr/local/bin/python3
+import re
+import socket
+import urllib.parse
+from collections import deque
+import zlib
+from html.parser import HTMLParser
+import argparse
+import sys
+
+
+current_page_links = []
+secret_flags = []
+visited = set("http://www.3700.network/fakebook/")
+
+
+
+class MyHTMLParser(HTMLParser):
+    def handle_starttag(self, tag, attrs):
+
+        if (len(attrs) == 0):
+            return
+
+        if (tag == 'h2'):
+            if(attrs[0][0] == 'secret_flag'):
+                secret_flags.append(attrs[0][1])
+
+        if (attrs[0][0] != 'href'):
+            return
+        if (not attrs[0][1] in current_page_links):
+            current_page_links.append(attrs[0][1])
+
+    def handle_data(self, data):
+        if (data.find('FLAG:') >= 0):
+            print(data[6:])
+            secret_flags.append(data[6:])
+
+
+class WebCrawler:
+    HOST = "www.3700.network"
+    PORT = 80
+
+    CSRF_TOKEN_NAME = "csrftoken"
+    csrf_token = None
+
+    SESSION_ID_NAME = "sessionid"
+    session_id = None
+
+    sock = None
+    html_parser = MyHTMLParser()
+
+    def __init__(self, username, password):
+        self.sock = socket.socket()
+        self.sock.connect((self.HOST, self.PORT))
+        first_page = self.login(username, password)
+        self.html_parser.feed(first_page)
+
+
+
+    def login(self, username, password):
+        LOGIN_URL = "http://www.3700.network/accounts/login/?next=/fakebook/"
+        request = str("GET " + LOGIN_URL + " HTTP/1.1\r\nHost: " + self.HOST + "\r\nConnection: close\r\nAccept-Encoding: gzip, deflate\r\n\r\n")
+
+
+        self.sock.sendall(request.encode())
+        recv = self.recv_msg()
+        groups = re.findall(r"(.+): ([^\r]+)", recv)
+        for group in groups:
+            if group[0] == "Set-Cookie":
+                contents = group[1].split(";")
+                id, val = contents[0].split("=")
+                if id == self.CSRF_TOKEN_NAME:
+                    self.csrf_token = val
+
+
+        post_request = str("POST http://www.3700.network/accounts/login/ HTTP/1.1\r\nHost: " + self.HOST + "\r\n")
+        post_request += "Content-Length: 107\r\n"
+        post_request += "Content-Type: application/x-www-form-urlencoded\r\n"
+        post_request += "Connection: close\r\nAccept-Encoding: gzip, deflate\r\n"
+        post_request += str("Cookie: csrftoken=" + self.csrf_token + "\r\n\r\n")
+        post_request += "username={}&password={}&csrfmiddlewaretoken={}&next=%2Ffakebook%2F\r\n".format(username, password, self.csrf_token)
+        self.sock.close()
+        self.sock = socket.socket()
+        self.sock.connect((self.HOST, self.PORT))
+        self.sock.sendall(post_request.encode())
+
+        response = self.recv_msg()
+        (response_code, headers, _) = self.parse_response(response)
+
+        cookie_header = headers["Set-Cookie"]
+        contents = cookie_header.split(";")
+        id, val = contents[0].split("=")
+        self.session_id = val
+        if response_code != "302":
+            raise RuntimeError("Login did not return 302 redirect")
+
+        self.sock.close()
+        self.sock = socket.socket()
+        self.sock.connect((self.HOST, self.PORT))
+        
+        (_, _, html) = self.get(headers["Location"])
+
+        return html
+
+
+    def get(self, path):
+        request = "GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\nAccept-Encoding: gzip, deflate\r\n".format(path, self.HOST)
+        request += "Cookie: csrftoken={}; sessionid={}\r\n\r\n".format(self.csrf_token, self.session_id)
+        self.sock.close()
+        self.sock = socket.socket()
+        self.sock.connect((self.HOST, self.PORT))
+        self.sock.sendall(request.encode())
+
+        response = self.recv_msg()
+
+        (response_code, headers, html) = self.parse_response(response)
+
+        if response_code == "403" or response_code == "404":
+            return None
+        elif response_code == "500":
+            return self.get(path)
+        else:
+            return response_code, headers, html
+
+
+    def recv_msg(self):
+        res = b""
+        data = self.sock.recv(4096)
+        while data:
+            res += data
+            data = self.sock.recv(4096)
+
+        end_of_headers = -1
+        for i in range(len(res) - 1):
+            if res[i:i+4].decode() == "\r\n\r\n":
+                end_of_headers = i + 4
+                break
+
+        header_bytes = res[:end_of_headers]
+        headers = self.__header_parse(header_bytes.decode())
+        content_bytes = res[end_of_headers:]
+        try:
+            if "Content-Encoding" in headers and headers["Content-Encoding"] == "gzip":
+                content = zlib.decompress(content_bytes, 16+zlib.MAX_WBITS).decode()
+            elif "Transfer-Encoding" in headers:
+                content = content_bytes.decode()
+            else:
+                raise RuntimeError("No encoding")
+
+            return header_bytes.decode() + content
+        except RuntimeError:
+            return ""
+
+
+
+    def parse_response(self, response):
+        response_sections = response.split("\r\n\r\n")
+
+        header_section = response_sections[0]
+        response_code = header_section[9:12]
+
+        headers = self.__header_parse(header_section)
+
+        html_data = []
+        for i in range(1, len(response_sections), 2):
+            html_data.append(response_sections[i])
+
+        if "Transfer-Encoding" in headers:
+            html = "".join(html_data)
+            chunks = html.split("\r\n")
+            html_data = []
+            for i in range(1, len(chunks), 2):
+                chunk = chunks[i]
+                html_data.append(chunk)
+
+            html = "".join(html_data)
+        else:
+            html = response_sections[1]
+        return (response_code, headers, html)
+
+
+
+    def __header_parse(self, header_group):
+        gg = re.findall(r"(.+): ([^\r]+)", header_group)
+        headers = {}
+        for group in gg:
+            headers[group[0]] = group[1]
+
+        return headers
+
+
+    def crawl(self):
+        global current_page_links, visited
+        while (current_page_links and len(secret_flags) < 5):
+            
+            current_url = current_page_links.pop(0)
+            if current_url in visited:
+                continue
+
+            visited.add(current_url)
+            html_data = self.get(current_url)
+            if not html_data:
+                continue
+            else:
+                self.html_parser.feed(html_data[2])
+            print("visited: ", len(visited))
+
+
+
+client = WebCrawler(str(sys.argv[1]), str(sys.argv[2]))
+client.crawl()
+
+print("secret_flags: ", secret_flags)
+
+
