@@ -1,0 +1,448 @@
+#!/usr/bin/env python3
+
+import sys, socket, select, datetime, json, random, time
+from collections import deque
+
+TERM_CONFLICT = 'conf_term'
+START_TERM = 'START_TERM'
+DEFAULT_LEADER = 'FFFF'
+IDX_LOG = 'log_index'
+TERM_LOG = 'log_term'
+
+
+my_id = sys.argv[1]
+
+replica_ids = sys.argv[2:]
+
+TOTAL_REPLICAS = len(replica_ids) + 1
+MAJORITY = TOTAL_REPLICAS // 2
+
+LEADER = 0
+FOLLOWER = 1
+CANDIDATE = 2
+
+SRC = 'src'
+DST = 'dst'
+LEAD = 'leader'
+TYPE = 'type'
+MID = 'MID'
+TERM = 'term'
+KEY = 'key'
+VAL = 'value'
+
+ELECTION_TIMEOUT = random.randint(150, 350)
+HEARTBEAT_TIMER = 90
+APPEND_TIMEOUT = 4000
+
+max_entries = 80
+term = 0
+status = FOLLOWER
+voted = False
+vote_count = 0
+voted_leader = DEFAULT_LEADER
+commit_index = -1
+max_recv = 131072
+sock_timeout = 0.005
+
+
+sock = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+sock.connect(my_id)
+
+prev_beat = 0
+msg_log = []
+data_map = {}
+is_put = False
+current_put = None
+working = False
+current_msg = None
+command_start_time = -1
+put_commit = {}
+
+command_queue = []
+commits = {}
+
+
+
+def make_leader():
+	global status, voted, vote_count, voted_leader, prev_beat, commit_index, msg_log, data_map, replica_ids, commits
+	status = LEADER
+	voted = False
+	vote_count = 0
+	voted_leader = my_id
+	prev_beat = get_time()
+	if commit_index < len(msg_log) - 1:
+		for i in range(commit_index + 1, len(msg_log)):
+			data_map[msg_log[i][1]] = msg_log[i][2]
+			#send_msg(create_put_m({SRC: msg_log[i][4], MID: msg_log[i][3]}))
+			send_msg({SRC: my_id, DST: msg_log[i][4], LEAD: voted_leader, TYPE: "ok", MID: msg_log[i][3]})
+		commit_index = len(msg_log) - 1
+	send_heartbeat()
+	for replica in replica_ids:
+		commits[replica] = len(msg_log)
+
+	iter_queue()
+
+def make_follower():
+	global voted, vote_count, status, term, prev_beat, voted_leader, is_put, working
+
+
+	if is_put:
+		is_put = False
+	elif working:
+		send_redirect(current_msg)
+		working = False
+	voted = False
+	vote_count = 0
+	status = FOLLOWER
+	term = leader_term
+	prev_beat = get_time()
+	voted_leader = msg[LEAD]
+
+	redir_queue()
+
+
+def send_redirect(msg):
+	send_msg({SRC: my_id, DST: msg[SRC], LEAD: voted_leader, TYPE: "redirect", MID: msg[MID]})
+
+
+def send_fail(msg):
+	send_msg({SRC: my_id, DST: msg[SRC], LEAD: voted_leader, TYPE: "fail", MID: msg[MID]})
+
+
+def send_heartbeat(dest=DEFAULT_LEADER):
+	# Info: required info, term
+	send_msg({SRC: my_id, DST: dest, LEAD: my_id, TYPE: "append", TERM: term, 'cidx': commit_index})
+
+
+def create_append_rpc_entries(replica, nexti, mid):
+	global msg_log
+
+	prev_id = nexti - 1
+	prev_term = msg_log[prev_id][0]
+	if len(msg_log) - nexti > max_entries - 1:
+		entries = msg_log[nexti:nexti + max_entries + 1]
+	else:
+		entries = msg_log[nexti:]
+
+	return {SRC: my_id, DST: replica, LEAD: my_id, TYPE: "append", MID: mid, TERM: term, 'prev_idx': prev_id,
+			'prev_term': prev_term, 'cidx': commit_index, 'logs': entries}
+
+
+def send_failed_append(destination, mid=None, conflicting_term=None, START_TERM=None):
+	msg = {SRC: my_id, DST: destination, LEAD: voted_leader, TERM: term, TYPE: "fail_append"}
+	if conflicting_term:
+		msg[TERM_CONFLICT] = conflicting_term
+
+	if START_TERM:
+		msg[START_TERM] = START_TERM
+
+	if mid:
+		msg[MID] = mid
+
+	send_msg(msg)
+
+
+def send_msg(msg):
+	sock.sendall(json.dumps(msg).encode())
+
+
+def get(key):
+	try:
+		return data_map.get(key, "")
+	except:
+		return False
+
+
+def check_commits():
+	global commit_index, leader_commit_idx, msg_log, data_map
+	if commit_index < leader_commit_idx:
+		old_commit_idx = commit_index
+		commit_index = min(leader_commit_idx, len(msg_log) - 1)
+		for i in range(old_commit_idx + 1, commit_index + 1):
+			data_map[msg_log[i][1]] = msg_log[i][2]
+
+def echo_put(put_msg):
+	global prev_beat, is_put, current_put, put_commit, msg_log, command_start_time
+
+	is_put = True
+	current_put = put_msg
+	command_start_time = get_time()
+	put_commit = {}
+	msg_log.append((term, put_msg[KEY], put_msg[VAL], put_msg[MID], put_msg[SRC]))
+
+	for replica in replica_ids:
+		put_commit[replica] = False
+		replica_msg = create_append_rpc_entries(replica, len(msg_log) - 1, put_msg[MID])
+		send_msg(replica_msg)
+
+	prev_beat = get_time()
+
+
+
+def check_redirect(new_msg):
+	global voted_leader, working, command_queue, current_msg, command_start_time
+	if voted_leader != DEFAULT_LEADER:
+		send_redirect(new_msg)
+	else:
+		if working:
+			command_queue.append(new_msg)
+		else:
+			current_msg = msg
+			working = True
+			command_start_time = get_time()
+
+
+
+def check_election():
+	global clock, prev_beat, ELECTION_TIMEOUT, status, term, vote_count, voted, voted_leader, msg_log
+
+	if clock - prev_beat > ELECTION_TIMEOUT and status != LEADER:
+		voted = True
+		term += 1
+		vote_count = 1
+		status = CANDIDATE
+
+		if not msg_log:
+			vote_req = {SRC: my_id, DST: DEFAULT_LEADER, LEAD: DEFAULT_LEADER, TYPE: 'req_vote', TERM: term, IDX_LOG: -1, TERM_LOG: 0}
+		else:
+			vote_req = {SRC: my_id, DST: DEFAULT_LEADER, LEAD: DEFAULT_LEADER, TYPE: 'req_vote', TERM: term, 
+				IDX_LOG: len(msg_log) - 1, TERM_LOG: msg_log[-1][0]}
+
+		voted_leader = DEFAULT_LEADER
+		prev_beat = clock
+		ELECTION_TIMEOUT = random.randint(150, 350)
+		send_msg(vote_req)
+
+
+
+def check_put_timeout():
+	global clock, command_start_time, current_msg, command_queue, working, status
+
+	if working and status != LEADER:
+		if clock - command_start_time >= APPEND_TIMEOUT:
+
+			send_fail(current_msg)
+			if command_queue:
+				current_msg = command_queue.pop(0)
+				command_start_time = clock
+			else:
+				working = False
+
+def check_put_fail():
+	global is_put, status, clock, command_start_time, current_put, command_queue
+
+	if is_put and status == LEADER:
+		if clock - command_start_time >= APPEND_TIMEOUT:
+			send_fail(current_put)
+			if command_queue:
+				iter_queue()
+			else:
+				is_put = False
+	return
+
+
+def update_indices():
+	global ENTIRES, msg, msg_log, TERM_CONFLICT, START_TERM
+	if 'logs' in msg:
+		prev_id = msg['prev_idx']
+		prev_term = msg['prev_term']
+
+		if prev_id == -1 or len(msg_log) == 0:
+			msg_log = msg['logs']
+			send_msg({SRC: my_id, DST: msg[SRC], LEAD: voted_leader, TERM: term, TYPE: "OK_append", MID: msg[MID],
+			IDX_LOG: len(msg_log) - 1})
+		elif prev_id >= len(msg_log):
+			send_failed_append(msg[SRC], msg[MID], term, len(msg_log))
+		elif msg_log[prev_id][0] != prev_term:
+
+			TERM_CONFLICT = msg_log[prev_id][0]
+			START_TERM = -1
+			for i in range(prev_id, 0, -1):
+				if msg_log[i][0] == TERM_CONFLICT and msg_log[i - 1][0] < TERM_CONFLICT:
+					START_TERM = i
+					break
+			
+			send_failed_append(msg[SRC], msg[MID], TERM_CONFLICT, START_TERM)
+		else:
+			msg_log = msg_log[:prev_id + 1]
+			msg_log = msg_log + msg['logs']
+			send_msg({SRC: my_id, DST: msg[SRC], LEAD: voted_leader, TERM: term, TYPE: "OK_append", MID: msg[MID],
+			IDX_LOG: len(msg_log) - 1})
+
+def commit_put():
+	global msg, msg_log, put_commit, commits, data_map, current_put, commit_index, is_put
+
+	if msg[IDX_LOG] + 1 == len(msg_log):
+		ok_replica = msg[SRC]
+		put_commit[ok_replica] = True
+		commits[ok_replica] = msg[IDX_LOG] + 1
+		num_true = 0
+		for stat in put_commit.values():
+			if stat:
+				num_true += 1
+
+		if num_true > MAJORITY - 1:
+			commit_index = len(msg_log) - 1
+			data_map[msg_log[-1][1]] = msg_log[-1][2]
+			#send_msg(create_put_m(current_put))
+			send_msg({SRC: my_id, DST: current_put[SRC], LEAD: voted_leader, TYPE: "ok", MID: current_put[MID]})
+			is_put = False
+			current_put = None
+
+			iter_queue()
+	else:
+		commits[msg[SRC]] = msg[IDX_LOG] + 1
+
+def vote(vote_msg):
+	global voted, prev_beat, term, status, voted_leader, vote_resp, msg
+
+	voted = True
+	status = FOLLOWER
+	prev_beat = get_time()
+	term = msg[TERM]
+	voted_leader = DEFAULT_LEADER
+	send_msg({SRC: my_id, DST: msg[SRC], LEAD: DEFAULT_LEADER, TYPE: 'resp_vote'})
+
+
+def iter_queue():
+	global command_queue
+	while len(command_queue) > 0:
+		com = command_queue.pop(0)
+		if com[TYPE] == 'get':
+			send_get(com)
+		else:
+			echo_put(com)
+			break
+
+
+def send_get(msg):
+	resp = {SRC: my_id, DST: msg[SRC], LEAD: voted_leader, TYPE: "ok", MID: msg[MID], VAL: get(msg[KEY])}
+	send_msg(resp)
+
+def redir_queue():
+	global command_queue
+	for com in command_queue:
+		send_redirect(com)
+
+	command_queue = []
+
+
+
+def echo_heartbeat():
+	global clock, prev_beat, status, is_put, current_put, commits, put_commit
+	if clock - prev_beat >= HEARTBEAT_TIMER and status == LEADER:
+		if is_put:
+			for replica, put_stat in put_commit.items():
+				if put_stat:
+					send_heartbeat(replica)
+				else:
+					send_msg(create_append_rpc_entries(replica, commits[replica], current_put[MID]))
+
+		else:
+			send_heartbeat()
+		prev_beat = get_time()
+
+def get_time():
+	return datetime.datetime.now().timestamp() * 1000
+
+
+
+
+time.sleep(1)
+
+
+while True:
+	ready = select.select([sock], [], [], sock_timeout)[0]
+	if sock in ready:
+		msg_raw = sock.recv(max_recv)
+		if len(msg_raw) == 0: continue
+		msg = json.loads(msg_raw)
+		if msg[TYPE] == 'get':
+			if status != LEADER:
+				check_redirect(msg)
+			else:
+				if is_put:
+					command_queue.append(msg)
+				else:
+					send_get(msg)
+
+		elif msg[TYPE] == 'put':
+			if status != LEADER:
+				check_redirect(msg)
+			else:
+				if is_put:
+					command_queue.append(msg)
+				else:
+					echo_put(msg)
+
+		elif msg[TYPE] == "append":
+			leader_term = msg[TERM]
+			leader_commit_idx = msg['cidx']
+			if leader_term < term:
+				send_failed_append(msg[SRC])
+			else:
+				if leader_term >= term:
+					make_follower()
+
+				check_commits()
+				update_indices()
+
+		elif msg[TYPE] == "OK_append" and status == LEADER:
+			if (current_put and current_put[MID] == msg[MID]):
+				commit_put()
+			else:
+				commits[msg[SRC]] = msg[IDX_LOG] + 1
+
+		elif msg[TYPE] == "fail_append" and status == LEADER:
+			if msg[TERM] <= term:
+				if START_TERM in msg:
+					replica = msg[SRC]
+					if msg[START_TERM] == -1:
+						commits[replica] = 0
+					else:
+						commits[replica] = msg[START_TERM]
+
+					if current_put and msg[MID] == current_put[MID]:
+						create_append_rpc_entries(replica, commits[replica], msg[MID])
+			else:
+				if msg[LEAD] != DEFAULT_LEADER and msg[LEAD] != my_id:
+					status = FOLLOWER
+					if is_put:
+						is_put = False
+						redir_queue()
+				else:
+					term = msg[TERM] + 1
+			
+
+		elif msg[TYPE] == 'req_vote':
+			if not voted or term < msg[TERM]:
+				if not msg_log:
+					if msg[TERM_LOG] > 0 or (msg[TERM_LOG] == 0 and msg[IDX_LOG] >= len(msg_log) - 1):
+						vote(msg)
+				else:
+					if msg[TERM_LOG] > msg_log[-1][0] or (msg[TERM_LOG] == msg_log[-1][0] and msg[IDX_LOG] >= len(msg_log) - 1):
+						vote(msg)
+
+		elif msg[TYPE] == 'resp_vote':
+			vote_count += 1
+			if vote_count > MAJORITY:
+				make_leader()
+				
+
+	clock = get_time()
+
+	check_election()
+
+	check_put_timeout()
+
+	check_put_fail()
+
+	echo_heartbeat()
+
+
+
+
+
+
+
+
